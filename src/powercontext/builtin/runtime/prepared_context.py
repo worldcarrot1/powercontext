@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -106,6 +108,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[EvidenceFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,6 +121,143 @@ class MemoryEntryAddress:
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
+
+
+@dataclass(frozen=True)
+class EvidenceFragment:
+    """One verbatim span of an original Memory entry with its exact citation identity."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
+
+
+_EVIDENCE_WORD_RE = re.compile(r"[^\W_]+")
+_EVIDENCE_MAX_CHUNK_BYTES = 900
+_MAX_FRAGMENTS_PER_ENTRY = 4
+_MAX_EVIDENCE_FRAGMENTS = 24
+_EVIDENCE_STOPWORDS = frozenset(
+    """
+    a about after again against all also an and any are as at be because been before below between both but by can
+    could did do does doing for from further had has have he her here hers him his how i if in into is it its just me
+    more my no not of on or our out over own she should so some such than that the their them then there these they
+    this those to too us was we were what when where which while who why will with without would you your
+    """.split()
+)
+
+
+def _evidence_terms(text: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for word in _EVIDENCE_WORD_RE.findall(text.casefold()):
+        counts[word] = counts.get(word, 0) + 1
+    return counts
+
+
+def _query_terms(query: str) -> tuple[str, ...]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for word in _EVIDENCE_WORD_RE.findall(query.casefold()):
+        if word in _EVIDENCE_STOPWORDS or len(word) < 2 or word in seen:
+            continue
+        seen.add(word)
+        ordered.append(word)
+    return tuple(ordered)
+
+
+def _sentence_intervals(text: str) -> tuple[tuple[int, int], ...]:
+    """Split entry text into sentence-bounded original spans, none longer than the chunk cap."""
+
+    raw: list[tuple[int, int]] = []
+    length = len(text)
+    start = 0
+    index = 0
+    while index < length:
+        char = text[index]
+        if char in ".!?" or char in "\n\r":
+            end = index + 1 if char in ".!?" else index
+            if text[start:end].strip():
+                raw.append((start, end))
+            start = end
+        index += 1
+    if start < length and text[start:].strip():
+        raw.append((start, length))
+    spans: list[tuple[int, int]] = []
+    for begin, end in raw:
+        segment = text[begin:end]
+        if len(segment.encode("utf-8")) <= _EVIDENCE_MAX_CHUNK_BYTES:
+            offset = 0
+            while offset < len(segment) and segment[offset].isspace():
+                offset += 1
+            if begin + offset < end:
+                spans.append((begin + offset, end))
+            continue
+        window_start = None
+        window_bytes = 0
+        window_end = 0
+        for match in re.finditer(r"\S+\s*", segment):
+            piece_bytes = len(match.group().encode("utf-8"))
+            if window_start is None:
+                window_start = match.start()
+                window_bytes = piece_bytes
+                window_end = match.end()
+                continue
+            if window_bytes + piece_bytes > _EVIDENCE_MAX_CHUNK_BYTES:
+                spans.append((begin + window_start, begin + window_end))
+                window_start = match.start()
+                window_bytes = piece_bytes
+                window_end = match.end()
+            else:
+                window_bytes += piece_bytes
+                window_end = match.end()
+        if window_start is not None:
+            spans.append((begin + window_start, begin + window_end))
+    return tuple(spans)
+
+
+def _score_entry_intervals(
+    text: str,
+    spans: tuple[tuple[int, int], ...],
+    query_terms: tuple[str, ...],
+    idf: dict[str, float],
+) -> tuple[tuple[float, int, int], ...]:
+    scored: list[tuple[float, int, int]] = []
+    for begin, end in spans:
+        counts = _evidence_terms(text[begin:end])
+        score = 0.0
+        matched = 0
+        for term in query_terms:
+            tf = counts.get(term, 0)
+            if tf:
+                matched += 1
+                score += idf[term] * (1.0 + math.log(min(tf, 8)))
+        if matched:
+            scored.append((score + 0.5 * matched, begin, end))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return tuple(scored)
+
+
+def _render_evidence(fragments: Sequence[EvidenceFragment]) -> str:
+    items = [
+        {
+            "citation": {
+                "scope_id": fragment.address.memory.scope_id,
+                "memory_ref": fragment.address.memory.artifact.model_dump(mode="json"),
+                "entry_id": fragment.address.entry_id,
+                "entry_version_id": fragment.address.entry_version_id,
+            },
+            "content": fragment.text,
+            "start": fragment.start,
+            "end": fragment.end,
+        }
+        for fragment in fragments
+    ]
+    encoded = json.dumps(
+        {"trust": "untrusted_history", "items": items},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
 
 
 @dataclass(frozen=True)
@@ -235,6 +375,13 @@ class PreparedContextBuilder:
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
 
+        if request.evidence_selection:
+            return self._build_evidence_result(
+                request=request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
+
         content, origins, omissions = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
@@ -254,6 +401,94 @@ class PreparedContextBuilder:
             context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
             origins=origins,
             omissions=omissions,
+        )
+
+    def _build_evidence_result(
+        self,
+        *,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Select verbatim evidence spans from Memory hits for ``request.query``."""
+
+        def empty_build() -> PreparedContextBuild:
+            return PreparedContextBuild(context=self.empty(), origins=(), omissions=PreparedContextOmissions())
+
+        query_terms = _query_terms(request.query)
+        if not query_terms:
+            return empty_build
+
+        staged: list[tuple[MemoryEntryAddress, str, tuple[tuple[int, int], ...]]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for group in memory_candidates:
+            scope_id = group.scope_id or current_scope_id or ""
+            for hit in group.hits:
+                if hit.memory_ref is None:
+                    raise PreparedContextInvariantError("memory-ref-missing")
+                identity = (scope_id, hit.memory_ref.artifact_id, hit.entry_id, hit.entry_version_id)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if not hit.text.strip():
+                    continue
+                address = MemoryEntryAddress(
+                    memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+                spans = _sentence_intervals(hit.text)
+                if not spans:
+                    continue
+                staged.append((address, hit.text, spans))
+
+        if not staged:
+            return empty_build
+
+        interval_term_sets: list[set[str]] = []
+        for _address, text, spans in staged:
+            for begin, end in spans:
+                interval_term_sets.append(set(_evidence_terms(text[begin:end])))
+        total_intervals = max(1, len(interval_term_sets))
+        idf: dict[str, float] = {}
+        for term in query_terms:
+            df = sum(1 for terms in interval_term_sets if term in terms)
+            idf[term] = math.log(1.0 + (total_intervals - df + 0.5) / (df + 0.5))
+
+        candidate_rows: list[tuple[int, float, int, int, int, MemoryEntryAddress, str]] = []
+        for entry_index, (address, text, spans) in enumerate(staged):
+            scored = _score_entry_intervals(text, spans, query_terms, idf)[:_MAX_FRAGMENTS_PER_ENTRY]
+            for depth, (score, begin, end) in enumerate(scored):
+                candidate_rows.append((depth, -score, entry_index, begin, end, address, text[begin:end]))
+        if not candidate_rows:
+            return empty_build
+        candidate_rows.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
+
+        fragments: list[EvidenceFragment] = []
+        committed: dict[int, list[tuple[int, int]]] = {}
+        content: str | None = None
+        content_bytes = 0
+        for _depth, _neg, entry_index, begin, end, address, span_text in candidate_rows:
+            intervals = committed.setdefault(entry_index, [])
+            if any(begin < sel_end and sel_begin < end for sel_begin, sel_end in intervals):
+                continue
+            trial = _render_evidence((*fragments, EvidenceFragment(address=address, start=begin, end=end, text=span_text)))
+            trial_bytes = len(trial.encode("utf-8"))
+            if trial_bytes > request.max_bytes:
+                continue
+            fragments.append(EvidenceFragment(address=address, start=begin, end=end, text=span_text))
+            intervals.append((begin, end))
+            content = trial
+            content_bytes = trial_bytes
+            if len(fragments) >= _MAX_EVIDENCE_FRAGMENTS:
+                break
+
+        if content is None:
+            return empty_build
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
+            origins=tuple(fragment.address for fragment in fragments),
+            fragments=tuple(fragments),
         )
 
     def probe_budget(
