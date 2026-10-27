@@ -1557,7 +1557,17 @@ async def _run_topic_memory_worker(
     assignment: ArtifactProcessingWorkAssignment,
 ) -> ArtifactProcessingWorkerCompletion:
     async with _open_topic_memory_processor(spec, assignment.scope_id) as processor:
-        return await processor.process(assignment)
+        completion = await processor.process(assignment)
+        if completion.outcome is ArtifactProcessingWorkerOutcome.SUCCEEDED:
+            # Only a completed wave re-checks; the accepted wave itself never
+            # re-gates its remaining windows, and the child DB is open here.
+            await maybe_note_source_count(
+                processor._database,  # noqa: SLF001 - the processor owns the child DB
+                spec.config,
+                "topic-memory",
+                assignment.scope_id,
+            )
+    return completion
 
 
 @asynccontextmanager

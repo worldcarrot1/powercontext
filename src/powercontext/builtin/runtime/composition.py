@@ -107,6 +107,7 @@ from powercontext.builtin.persistence.sqlite.topic_memory_index import (
     SQLiteTopicMemoryVectorIndex,
 )
 from powercontext.builtin.persistence.tables import BUILTIN_TABLES
+from powercontext.builtin.runtime.source_count_trigger import SourceCountTrigger
 from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleWiring
 from powercontext.builtin.persistence.tag_schema import ensure_topic_memory_tag_schema
 from powercontext.builtin.persistence.topic_memory import TopicMemoryRepository
@@ -581,6 +582,11 @@ async def open_builtin_runtime(
                 for operation, family in (("refine_experience", "experience"), ("derive_skill", "skill"))
                 if family in registered_families
             )
+        count_trigger = SourceCountTrigger(
+            database=contexts.database,
+            memory_threshold=config.runtime.memory_source_count_threshold,
+            topic_threshold=config.runtime.topic_memory_source_count_threshold,
+        )
         topic_memory_processing_available = _topic_memory_processing_available(config, processing_bindings)
         runtime = await resources.enter_async_context(
             BuiltinRuntime(
@@ -659,11 +665,16 @@ async def open_builtin_runtime(
                     sources=contexts.repositories.sources,
                     artifacts=contexts.repositories.artifacts,
                 ),
+                count_trigger=count_trigger,
             )
         )
         runtime.artifact_processing_supervisor = await resources.enter_async_context(
             _open_artifact_processing_supervisor(config, contexts, processing_bindings, tracing=tracing)
         )
+        if count_trigger.enabled and runtime.artifact_processing_supervisor is not None:
+            count_trigger.notifier = runtime.artifact_processing_supervisor.wake
+            for startup_scope_id in await contexts.scope_ids():
+                await count_trigger.note(startup_scope_id)
         contexts.profiles.operation_context = runtime._operation
         if config.handoff_report.enabled:
             runtime.handoff_report = HandoffReportApplication(

@@ -248,6 +248,7 @@ from powercontext.builtin.runtime.recall_sufficiency import (
     build_recall_candidates,
     recall_effort,
 )
+from powercontext.builtin.runtime.source_count_trigger import SourceCountTrigger
 from powercontext.builtin.runtime.source_lifecycle import LifecycleApplication, SourceLifecycleWiring
 from powercontext.builtin.runtime.statistics import RelationalScopedStatistics, overview_selection
 from powercontext.builtin.scope import ScopeApplication, ScopeDescriptor, ScopeSelection
@@ -489,6 +490,7 @@ class ScopedSourceApplication:
                             span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
             except BaseValueConflictError as error:
                 raise SourceConflictError("identity", error.identity) from None
+            await self._runtime.note_source_count_trigger(self.scope_id)
             return SourceReceipt(
                 source_ref=SourceRef(source_type=record.source_type, source_id=record.source_id),
                 sequence=record.position,
@@ -505,6 +507,7 @@ class ScopedSourceApplication:
                 )
                 if span is not None:
                     span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
+            await self._runtime.note_source_count_trigger(self.scope_id)
             return SourceReceipt(source_ref=context.sources.catalog.as_ref(source), sequence=sequence)
 
 
@@ -564,7 +567,9 @@ class ScopedRecordApplication:
         /,
     ) -> ArtifactCreated:
         async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-            return await self._runtime._records().create_artifact(self.scope_id, family, write)
+            created = await self._runtime._records().create_artifact(self.scope_id, family, write)
+        await self._runtime.note_source_count_trigger(self.scope_id)
+        return created
 
     async def get_artifact(self, family: str, artifact_id: str, /) -> ArtifactRecord:
         async with self._runtime._scope_operation(self.scope_id):
@@ -2617,6 +2622,7 @@ class ScopedMemoryApplication:
                     if span is not None:
                         span.set_attributes({"powercontext.memory.flush.source_count": result.source_count})
                         span.set_outcome("success" if result.processed else "noop")
+                    await self._runtime.note_source_count_trigger(self.scope_id)
                     return result
 
     async def cursor(self) -> SourceCursor:
@@ -3036,6 +3042,7 @@ class BuiltinRuntime:
         statistics_service: StatisticsServiceFactory | None = None,
         record_service: RecordService | None = None,
         lifecycle_wiring: SourceLifecycleWiring | None = None,
+        count_trigger: SourceCountTrigger | None = None,
         prompt_service: PromptService | None = None,
         recall_token_estimator: RecallTokenEstimator | None = None,
         recall_effort_sink: RecallEffortSink | None = None,
@@ -3093,6 +3100,7 @@ class BuiltinRuntime:
         self._statistics_service = statistics_service
         self._record_service = record_service
         self._lifecycle_wiring = lifecycle_wiring
+        self._count_trigger = count_trigger
         self._prompt_service = prompt_service
         self._recall_token_estimator = recall_token_estimator
         self._recall_effort_sink = recall_effort_sink
@@ -3264,6 +3272,27 @@ class BuiltinRuntime:
             self._scheduler_runtime_key = None
             self._scheduler = None
             raise
+
+    async def note_source_count_trigger(self, scope_id: str) -> None:
+        """Re-evaluate Source count thresholds after one journal append."""
+
+        trigger = self._count_trigger
+        if trigger is None or not trigger.enabled:
+            return
+        try:
+            await trigger.note(scope_id)
+        except Exception as error:  # noqa: BLE001 - an append must never fail on the trigger
+            log_safely(
+                logger,
+                logging.WARNING,
+                "Source count trigger evaluation failed",
+                exc_info=error,
+                extra={
+                    "event": "source_count_trigger.note_failed",
+                    "scope": scope_id,
+                    "outcome": "retry_on_next_event",
+                },
+            )
 
     def configure_evidence_authorization(
         self,

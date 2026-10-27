@@ -38,6 +38,7 @@ from powercontext.builtin.runtime.processing_contracts import (
     ArtifactProcessingWorkerOutcome,
 )
 from powercontext.builtin.runtime.processing_execution import InvocationAlreadyHandled, ScopeInvocation
+from powercontext.builtin.runtime.source_count_trigger import maybe_note_source_count
 from powercontext.builtin.sources import BUILTIN_SOURCE_REGISTRY
 from powercontext.builtin.statistics import ModelUsagePurpose
 from powercontext.builtin.triggers import SOURCE_WINDOW_TRIGGER_NAME
@@ -210,6 +211,7 @@ async def _process_family_invocation(  # noqa: C901 - one guarded dispatch per r
                 authorize_snapshot=None if security is None else partial(security.authorize_memory, scope),
                 on_commit=None if security is None else partial(security.memory_commit, scope_id=scope),
             )
+            await maybe_note_source_count(contexts.database, config, "memory", scope)
             if result.held_count:
                 return ArtifactProcessingWorkerCompletion(held_count=result.held_count, hold_codes=result.hold_codes)
         elif assignment.artifact_family == "experience":
