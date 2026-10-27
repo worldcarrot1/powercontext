@@ -1025,6 +1025,36 @@ TOPIC_MEMORY_TABLES = (
 # OceanBase requires FK column lengths to match the parent. A normalized-key
 # fingerprint keeps composite indexes within 3072 bytes without narrowing any
 # Unicode identity or label. Queries also compare the full key, not just its hash.
+SOURCE_LIFECYCLE_NODES_TABLE = Table(
+    "pc_source_lifecycle_nodes",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_ID_LENGTH), primary_key=True),
+    Column("node_kind", identity_string(16), nullable=False),
+    Column("reference", _entry_text_type(), nullable=False),
+    Column("parents", _entry_text_type(), nullable=False),
+    Column("policy", identity_string(8)),
+    Column("lifecycle_revision", Integer),
+    Column("sequence", Integer),
+    Column("available", Boolean),
+    Column("event_state", _entry_text_type()),
+    Column("topic_hold", _entry_text_type()),
+    ForeignKeyConstraint(("scope_id",), ("pc_scopes.scope_id",), ondelete="RESTRICT"),
+    CheckConstraint(
+        "node_kind IN ('source', 'memory', 'topic')",
+        name="ck_pc_source_lifecycle_nodes_kind",
+    ),
+    CheckConstraint(
+        "policy IS NULL OR policy IN ('all', 'any')",
+        name="ck_pc_source_lifecycle_nodes_policy",
+    ),
+    CheckConstraint(
+        "sequence IS NULL OR sequence > 0",
+        name="ck_pc_source_lifecycle_nodes_sequence",
+    ),
+)
+
+
 ARTIFACT_TAGS_TABLE = Table(
     "pc_artifact_tags",
     SHARED_METADATA,
@@ -1187,5 +1217,10 @@ BUILTIN_TABLES = (
     + MEMORY_TABLES
     + STATISTICS_TABLES
     + RECURRENCE_TABLES
-    + (ARTIFACT_TAGS_TABLE, DREAM_RUNS_TABLE, RECEIPT_MIGRATION_REVIEW_TABLE)
+    + (
+        ARTIFACT_TAGS_TABLE,
+        DREAM_RUNS_TABLE,
+        RECEIPT_MIGRATION_REVIEW_TABLE,
+        SOURCE_LIFECYCLE_NODES_TABLE,
+    )
 )

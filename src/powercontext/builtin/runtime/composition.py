@@ -107,6 +107,7 @@ from powercontext.builtin.persistence.sqlite.topic_memory_index import (
     SQLiteTopicMemoryVectorIndex,
 )
 from powercontext.builtin.persistence.tables import BUILTIN_TABLES
+from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleWiring
 from powercontext.builtin.persistence.tag_schema import ensure_topic_memory_tag_schema
 from powercontext.builtin.persistence.topic_memory import TopicMemoryRepository
 from powercontext.builtin.persistence.topic_memory_index import (
@@ -651,6 +652,13 @@ async def open_builtin_runtime(
                 scheduled_source_runner=scheduled_source_runner,
                 scheduled_experience_runner=scheduled_experience_runner,
                 remote_ingestion=contexts,
+                lifecycle_wiring=SourceLifecycleWiring(
+                    database=contexts.database,
+                    nodes=contexts.repositories.source_lifecycle,
+                    topic_memories=contexts.repositories.topic_memories,
+                    sources=contexts.repositories.sources,
+                    artifacts=contexts.repositories.artifacts,
+                ),
             )
         )
         runtime.artifact_processing_supervisor = await resources.enter_async_context(
